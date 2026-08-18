@@ -1,8 +1,8 @@
 streamlit
 pandas
+numpy
 openpyxl
-pdfplumber
-pdf2image
-pytesseract
 Pillow
-PyMuPDF
+easyocr
+pdf2image
+torch --extra-index-url https://download.pytorch.org/whl/cpu
