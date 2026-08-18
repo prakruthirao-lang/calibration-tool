@@ -4,16 +4,6 @@ import io
 import re
 
 try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
-
-try:
-    import fitz  # PyMuPDF
-except ImportError:
-    fitz = None
-
-try:
     from PIL import Image
     import pytesseract
     from pdf2image import convert_from_bytes
@@ -21,30 +11,55 @@ except ImportError:
     pytesseract = None
 
 st.set_page_config(page_title="Calibration Chart Converter", layout="wide")
-
 st.title("📊 Tank Calibration Chart Converter & Flatten Tool")
-st.write("Upload your calibration chart (**Excel, CSV, or PDF**) to flatten MM-to-LTRS rows and fill missing values.")
 
 uploaded_file = st.file_uploader(
     "Upload Calibration File", 
     type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"]
 )
 
-def parse_text_to_df(raw_text):
-    lines = raw_text.split('\n')
-    rows = []
-    for line in lines:
-        nums = re.findall(r'\b\d+(?:[.,]\d+)?\b', line)
+def parse_ocr_blocks_to_df(image):
+    """
+    Extracts text using bounding box coordinates to ensure numbers
+    stay in their exact table columns and rows.
+    """
+    if not pytesseract:
+        return pd.DataFrame()
+    
+    # Get bounding boxes and word coordinates
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DATAFRAME)
+    data = data.dropna(subset=['text'])
+    data['text'] = data['text'].astype(str).str.strip()
+    data = data[data['text'] != '']
+    
+    # Group words by line coordinates
+    lines = []
+    grouped = data.groupby(['page_num', 'block_num', 'par_num', 'line_num'])
+    for _, group in grouped:
+        sorted_words = group.sort_values('left')['text'].tolist()
+        lines.append(sorted_words)
+    
+    # Process numeric calibration rows
+    structured_rows = []
+    for words in lines:
+        nums = []
+        for w in words:
+            cleaned = re.sub(r'[^0-9.]', '', w.replace(',', '.'))
+            if cleaned:
+                nums.append(cleaned)
+        
         if len(nums) >= 2:
-            rows.append(nums)
-    if rows:
-        max_cols = max(len(r) for r in rows)
-        padded_rows = [r + [None]*(max_cols - len(r)) for r in rows]
-        cols = ['H (mm)'] + [str(i) for i in range(max_cols - 1)]
-        return pd.DataFrame(padded_rows, columns=cols[:max_cols])
+            structured_rows.append(nums)
+            
+    if structured_rows:
+        max_cols = max(len(r) for r in structured_rows)
+        padded = [r + [None]*(max_cols - len(r)) for r in structured_rows]
+        cols = ['H_MM'] + [str(i) for i in range(max_cols - 1)]
+        return pd.DataFrame(padded, columns=cols[:max_cols])
+        
     return pd.DataFrame()
 
-def process_calibration_data(df):
+def flatten_calibration_df(df):
     records = []
     h_col = df.columns[0]
     
@@ -52,21 +67,25 @@ def process_calibration_data(df):
         try:
             base_mm = float(str(row[h_col]).replace(',', '').strip())
             for offset in range(10):
-                col_str = str(offset)
-                if col_str in df.columns and pd.notnull(row[col_str]):
-                    val = float(str(row[col_str]).replace(',', '').strip())
+                col_key = str(offset)
+                if col_key in df.columns and pd.notnull(row[col_key]):
+                    val_str = str(row[col_key]).replace(',', '').strip()
+                    val = float(val_str)
                     records.append({'MM': int(base_mm + offset), 'LTRS': val})
         except (ValueError, TypeError):
             continue
-    
-    flattened_df = pd.DataFrame(records)
-    if not flattened_df.empty:
-        flattened_df = flattened_df.sort_values('MM').drop_duplicates('MM').reset_index(drop=True)
-        max_mm = int(flattened_df['MM'].max())
+            
+    flattened = pd.DataFrame(records)
+    if not flattened.empty:
+        flattened = flattened.sort_values('MM').drop_duplicates('MM').reset_index(drop=True)
+        max_mm = int(flattened['MM'].max())
         
-        full_mm_df = pd.DataFrame({'MM': range(0, max(1750, max_mm + 1))})
-        merged = pd.merge(full_mm_df, flattened_df, on='MM', how='left')
-        merged['LTRS'] = merged['LTRS'].interpolate(method='linear').bfill()
+        # Build complete 0 to max_mm sequence
+        full_range = pd.DataFrame({'MM': range(0, max_mm + 1)})
+        merged = pd.merge(full_range, flattened, on='MM', how='left')
+        
+        # Linear interpolation for missing values
+        merged['LTRS'] = merged['LTRS'].interpolate(method='linear').bfill().ffill()
         return merged
     return df
 
@@ -78,47 +97,29 @@ if uploaded_file:
         df_extracted = pd.read_csv(uploaded_file) if file_type == 'csv' else pd.read_excel(uploaded_file)
 
     elif file_type == 'pdf':
-        st.info("📄 Processing PDF file...")
-        
-        # 1. Direct Table Extraction
-        if pdfplumber:
-            all_tables = []
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    for t in tables:
-                        if t:
-                            all_tables.extend(t)
-            if all_tables and len(all_tables) > 1:
-                df_extracted = pd.DataFrame(all_tables[1:], columns=all_tables[0])
-
-        # 2. Text Stream Parsing (PyMuPDF)
-        if (df_extracted is None or df_extracted.empty) and fitz:
-            uploaded_file.seek(0)
-            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text() + "\n"
-            df_extracted = parse_text_to_df(full_text)
-
-        # 3. OCR Image Fallback (Requires poppler-utils in packages.txt)
-        if df_extracted is None or df_extracted.empty:
-            st.info("⚡ Scanned image detected. Running OCR processing...")
+        st.info("📄 Processing multi-page PDF...")
+        if pytesseract:
             try:
                 uploaded_file.seek(0)
                 images = convert_from_bytes(uploaded_file.read())
-                ocr_text = ""
-                for img in images:
-                    ocr_text += pytesseract.image_to_string(img) + "\n"
-                df_extracted = parse_text_to_df(ocr_text)
+                
+                all_page_dfs = []
+                for i, img in enumerate(images):
+                    st.write(f"🔍 Reading page {i+1} of {len(images)}...")
+                    page_df = parse_ocr_blocks_to_df(img)
+                    if not page_df.empty:
+                        all_page_dfs.append(page_df)
+                
+                if all_page_dfs:
+                    df_extracted = pd.concat(all_page_dfs, ignore_index=True)
             except Exception as e:
-                st.error("Poppler system library is missing. Ensure `packages.txt` is added to your GitHub repository.")
+                st.error(f"OCR Exception: {e}")
 
     if df_extracted is not None and not df_extracted.empty:
-        flattened_df = process_calibration_data(df_extracted)
+        flattened_df = flatten_calibration_df(df_extracted)
         
-        st.subheader("✅ Extracted & Flattened Data Preview")
-        st.dataframe(flattened_df.head(20), use_container_width=True)
+        st.subheader(f"✅ Extracted & Flattened Data ({len(flattened_df)} total MM points)")
+        st.dataframe(flattened_df, use_container_width=True)
         
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -126,7 +127,7 @@ if uploaded_file:
         buffer.seek(0)
         
         st.download_button(
-            label="📥 Download Flattened Excel File",
+            label="📥 Download Complete Flattened Excel File",
             data=buffer,
             file_name="Flattened_Calibration_Data.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
