@@ -9,6 +9,11 @@ except ImportError:
     pdfplumber = None
 
 try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
     from PIL import Image
     import pytesseract
     from pdf2image import convert_from_bytes
@@ -16,12 +21,17 @@ except ImportError:
     pytesseract = None
 
 st.set_page_config(page_title="Calibration Chart Converter", layout="wide")
-st.title("📊 Tank Calibration Chart Converter & OCR Tool")
 
-uploaded_file = st.file_uploader("Upload Calibration File", type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"])
+st.title("📊 Tank Calibration Chart Converter & Flatten Tool")
+st.write("Upload your calibration chart (**Excel, CSV, or PDF**) to flatten MM-to-LTRS rows and fill missing values.")
 
-def parse_ocr_text_to_df(text):
-    lines = text.split('\n')
+uploaded_file = st.file_uploader(
+    "Upload Calibration File", 
+    type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"]
+)
+
+def parse_text_to_df(raw_text):
+    lines = raw_text.split('\n')
     rows = []
     for line in lines:
         nums = re.findall(r'\b\d+(?:[.,]\d+)?\b', line)
@@ -37,6 +47,7 @@ def parse_ocr_text_to_df(text):
 def process_calibration_data(df):
     records = []
     h_col = df.columns[0]
+    
     for _, row in df.iterrows():
         try:
             base_mm = float(str(row[h_col]).replace(',', '').strip())
@@ -47,10 +58,12 @@ def process_calibration_data(df):
                     records.append({'MM': int(base_mm + offset), 'LTRS': val})
         except (ValueError, TypeError):
             continue
+    
     flattened_df = pd.DataFrame(records)
     if not flattened_df.empty:
         flattened_df = flattened_df.sort_values('MM').drop_duplicates('MM').reset_index(drop=True)
         max_mm = int(flattened_df['MM'].max())
+        
         full_mm_df = pd.DataFrame({'MM': range(0, max(1750, max_mm + 1))})
         merged = pd.merge(full_mm_df, flattened_df, on='MM', how='left')
         merged['LTRS'] = merged['LTRS'].interpolate(method='linear').bfill()
@@ -65,6 +78,9 @@ if uploaded_file:
         df_extracted = pd.read_csv(uploaded_file) if file_type == 'csv' else pd.read_excel(uploaded_file)
 
     elif file_type == 'pdf':
+        st.info("📄 Processing PDF file...")
+        
+        # 1. Direct Table Extraction
         if pdfplumber:
             all_tables = []
             with pdfplumber.open(uploaded_file) as pdf:
@@ -76,19 +92,32 @@ if uploaded_file:
             if all_tables and len(all_tables) > 1:
                 df_extracted = pd.DataFrame(all_tables[1:], columns=all_tables[0])
 
-        # OCR fallback for DocScan scanned images
+        # 2. Text Stream Parsing (PyMuPDF)
+        if (df_extracted is None or df_extracted.empty) and fitz:
+            uploaded_file.seek(0)
+            doc = fitz.open(stream=uploaded_file.read(), filetype="pdf")
+            full_text = ""
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            df_extracted = parse_text_to_df(full_text)
+
+        # 3. OCR Image Fallback (Requires poppler-utils in packages.txt)
         if df_extracted is None or df_extracted.empty:
-            st.info("⚡ Scanned image PDF detected. Running OCR processing...")
-            if pytesseract:
+            st.info("⚡ Scanned image detected. Running OCR processing...")
+            try:
+                uploaded_file.seek(0)
                 images = convert_from_bytes(uploaded_file.read())
                 ocr_text = ""
                 for img in images:
                     ocr_text += pytesseract.image_to_string(img) + "\n"
-                df_extracted = parse_ocr_text_to_df(ocr_text)
+                df_extracted = parse_text_to_df(ocr_text)
+            except Exception as e:
+                st.error("Poppler system library is missing. Ensure `packages.txt` is added to your GitHub repository.")
 
     if df_extracted is not None and not df_extracted.empty:
         flattened_df = process_calibration_data(df_extracted)
-        st.subheader("✅ Extracted Data Preview")
+        
+        st.subheader("✅ Extracted & Flattened Data Preview")
         st.dataframe(flattened_df.head(20), use_container_width=True)
         
         buffer = io.BytesIO()
