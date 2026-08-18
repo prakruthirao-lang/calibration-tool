@@ -17,28 +17,43 @@ except ImportError:
 st.set_page_config(page_title="Calibration Chart Pipeline", layout="wide")
 
 # Sidebar Navigation
-mode = st.sidebar.radio("Select Pipeline Stage", ["Stage 1: Raw OCR Extractor", "Stage 2: Excel Normalizer & Flatten"])
+mode = st.sidebar.radio("Select Pipeline Stage", ["Stage 1: Clean Raw OCR Extractor", "Stage 2: Excel Normalizer & Flatten"])
 
 # ---------------------------------------------------------
-# STAGE 1: RAW OCR EXTRACTION
+# STAGE 1: CLEAN RAW OCR EXTRACTION
 # ---------------------------------------------------------
-if mode == "Stage 1: Raw OCR Extractor":
-    st.title("📄 Stage 1: Raw OCR Extraction to Excel")
-    st.write("Upload your PDF or Image chart to extract raw scanned text lines into a draft Excel file for manual review.")
+if mode == "Stage 1: Clean Raw OCR Extractor":
+    st.title("📄 Stage 1: Clean Raw OCR Extraction to Excel")
+    st.write("Upload your chart to extract raw scanned table lines with special characters (`|`, `_`, `~`, etc.) automatically removed.")
 
     uploaded_file = st.file_uploader("Upload Chart (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
+
+    def clean_text(text):
+        """Strips out vertical table borders '|', brackets, and punctuation artifacts."""
+        # Remove pipe symbols, slashes, brackets, and random noise chars
+        cleaned = re.sub(r'[\|\\/_~\-\[\]\{\}\(\)\*\$\^#@!&=+<>]', '', text)
+        # Standardize commas to decimal points for clean number representation
+        cleaned = cleaned.replace(',', '.')
+        return cleaned.strip()
 
     def extract_raw_rows(image):
         data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
         word_boxes = []
+        
         for i in range(len(data['text'])):
-            text = data['text'][i].strip()
-            if text:
-                word_boxes.append({'top': data['top'][i], 'left': data['left'][i], 'text': text})
+            raw_text = data['text'][i].strip()
+            cleaned = clean_text(raw_text)
+            
+            # Keep non-empty text boxes after symbol removal
+            if cleaned:
+                word_boxes.append({'top': data['top'][i], 'left': data['left'][i], 'text': cleaned})
                 
+        # Sort text blocks top-to-bottom
         word_boxes.sort(key=lambda item: item['top'])
+        
         rows, current_row, last_y = [], [], None
         for box in word_boxes:
+            # Group into the same horizontal row if Y-coordinates are within 12 pixels
             if last_y is None or abs(box['top'] - last_y) < 12:
                 current_row.append(box)
             else:
@@ -55,7 +70,7 @@ if mode == "Stage 1: Raw OCR Extractor":
 
     if uploaded_file:
         if pytesseract is None:
-            st.error("PyTesseract module is not available.")
+            st.error("PyTesseract module is missing.")
         else:
             images = []
             ext = uploaded_file.name.split('.')[-1].lower()
@@ -73,21 +88,22 @@ if mode == "Stage 1: Raw OCR Extractor":
             df_raw = pd.DataFrame([r + [''] * (max_cols - len(r)) for r in raw_rows])
             
             if not df_raw.empty:
-                st.subheader("📋 Raw OCR Matrix Preview")
+                st.subheader("📋 Cleaned Raw OCR Matrix Preview")
                 st.dataframe(df_raw, use_container_width=True)
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df_raw.to_excel(writer, index=False, header=[f"Col_{i+1}" for i in range(max_cols)])
                 buffer.seek(0)
-                st.download_button("📥 Download Raw Excel for Inspection", buffer, "raw_ocr_output.xlsx")
+                
+                st.download_button("📥 Download Cleaned Raw Excel", buffer, "raw_ocr_output_cleaned.xlsx")
 
 # ---------------------------------------------------------
 # STAGE 2: EXCEL NORMALIZATION & FLATTENING
 # ---------------------------------------------------------
 else:
     st.title("⚙️ Stage 2: Cleaned Excel to Flattened Table")
-    st.write("Upload your reviewed or edited Stage 1 Excel file (`raw_ocr_output.xlsx`) to generate the final calibration dataset.")
+    st.write("Upload your Stage 1 cleaned Excel file (`raw_ocr_output_cleaned.xlsx`) to generate the final dataset.")
 
     uploaded_excel = st.file_uploader("Upload Intermediate Excel File", type=["xlsx", "xls"])
 
@@ -96,18 +112,20 @@ else:
         for _, row in df.iterrows():
             nums = []
             for cell in row.dropna():
-                cleaned = re.sub(r'[^0-9.]', '', str(cell).replace(',', '.'))
+                cleaned = re.sub(r'[^0-9.]', '', str(cell))
                 if cleaned:
                     try:
                         nums.append(float(cleaned))
                     except ValueError:
                         continue
             
+            # Format 1: Base MM + 10 Offset Columns (0 to 9)
             if len(nums) >= 11:
                 base_mm = nums[0]
                 if 0 <= base_mm <= 5000:
                     for offset in range(10):
                         records.append({'MM': int(base_mm + offset), 'LTRS': nums[offset + 1]})
+            # Format 2: Direct Pair [MM, LTRS]
             elif len(nums) == 2:
                 mm_val, ltrs_val = nums[0], nums[1]
                 if 0 <= mm_val <= 5000:
