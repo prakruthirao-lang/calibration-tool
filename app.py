@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
 import re
+import cv2
 from PIL import Image
 
 try:
@@ -16,57 +18,83 @@ except ImportError:
 
 st.set_page_config(page_title="Calibration Chart Pipeline", layout="wide")
 
-# Sidebar Navigation
-mode = st.sidebar.radio("Select Pipeline Stage", ["Stage 1: Clean Raw OCR Extractor", "Stage 2: Excel Normalizer & Flatten"])
+mode = st.sidebar.radio("Select Pipeline Stage", ["Stage 1: Grid-Aware Table Extractor", "Stage 2: Excel Normalizer & Flatten"])
 
 # ---------------------------------------------------------
-# STAGE 1: CLEAN RAW OCR EXTRACTION
+# STAGE 1: GRID-BASED TABLE EXTRACTION
 # ---------------------------------------------------------
-if mode == "Stage 1: Clean Raw OCR Extractor":
-    st.title("📄 Stage 1: Clean Raw OCR Extraction to Excel")
-    st.write("Upload your chart to extract raw scanned table lines with special characters (`|`, `_`, `~`, etc.) automatically removed.")
+if mode == "Stage 1: Grid-Aware Table Extractor":
+    st.title("📄 Stage 1: OpenCV Grid Cell Extractor")
+    st.write("Extracts text by detecting image table lines directly, preserving exact row and column structure.")
 
     uploaded_file = st.file_uploader("Upload Chart (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
 
     def clean_text(text):
-        """Strips out vertical table borders '|', brackets, and punctuation artifacts."""
-        # Remove pipe symbols, slashes, brackets, and random noise chars
         cleaned = re.sub(r'[\|\\/_~\-\[\]\{\}\(\)\*\$\^#@!&=+<>]', '', text)
-        # Standardize commas to decimal points for clean number representation
         cleaned = cleaned.replace(',', '.')
         return cleaned.strip()
 
-    def extract_raw_rows(image):
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-        word_boxes = []
+    def extract_table_cells_opencv(pil_img):
+        """Detects explicit table grid boxes using computer vision morphological operations."""
+        img_np = np.array(pil_img.convert('RGB'))
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
         
-        for i in range(len(data['text'])):
-            raw_text = data['text'][i].strip()
-            cleaned = clean_text(raw_text)
-            
-            # Keep non-empty text boxes after symbol removal
-            if cleaned:
-                word_boxes.append({'top': data['top'][i], 'left': data['left'][i], 'text': cleaned})
+        # Threshold image to binary
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        
+        # Detect vertical lines
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 30))
+        vert = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_v)
+        
+        # Detect horizontal lines
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+        horiz = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
+        
+        # Combine grid lines
+        table_grid = cv2.add(vert, horiz)
+        
+        # Find table cell contours
+        contours, _ = cv2.findContours(table_grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        boxes = []
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            # Filter out tiny noise boxes and page border frames
+            if 15 < w < (img_np.shape[1] * 0.8) and 10 < h < (img_np.shape[0] * 0.5):
+                boxes.append((x, y, w, h))
                 
-        # Sort text blocks top-to-bottom
-        word_boxes.sort(key=lambda item: item['top'])
+        if not boxes:
+            # Fallback to pure OCR if no grid lines detected
+            return None
+
+        # Sort detected boxes into structured rows & columns
+        boxes = sorted(boxes, key=lambda b: b[1])  # Sort top-to-bottom
         
-        rows, current_row, last_y = [], [], None
-        for box in word_boxes:
-            # Group into the same horizontal row if Y-coordinates are within 12 pixels
-            if last_y is None or abs(box['top'] - last_y) < 12:
-                current_row.append(box)
+        # Cluster boxes by horizontal row coordinates
+        rows = []
+        current_row = [boxes[0]]
+        for b in boxes[1:]:
+            if abs(b[1] - current_row[0][1]) < 12:
+                current_row.append(b)
             else:
-                current_row.sort(key=lambda item: item['left'])
-                rows.append([b['text'] for b in current_row])
-                current_row = [box]
-            last_y = box['top']
-            
+                rows.append(sorted(current_row, key=lambda item: item[0])) # Sort left-to-right
+                current_row = [b]
         if current_row:
-            current_row.sort(key=lambda item: item['left'])
-            rows.append([b['text'] for b in current_row])
+            rows.append(sorted(current_row, key=lambda item: item[0]))
             
-        return rows
+        # OCR process each isolated grid cell
+        matrix = []
+        for row in rows:
+            row_data = []
+            for (x, y, w, h) in row:
+                cell_crop = gray[y:y+h, x:x+w]
+                # Upsample cell for better OCR accuracy
+                cell_crop = cv2.resize(cell_crop, (0, 0), fx=2, fy=2)
+                raw_text = pytesseract.image_to_string(cell_crop, config='--psm 6').strip()
+                row_data.append(clean_text(raw_text))
+            matrix.append(row_data)
+            
+        return matrix
 
     if uploaded_file:
         if pytesseract is None:
@@ -79,31 +107,34 @@ if mode == "Stage 1: Clean Raw OCR Extractor":
             else:
                 images = [Image.open(uploaded_file)]
                 
-            raw_rows = []
+            raw_matrix = []
             for idx, img in enumerate(images):
-                st.info(f"Scanning page {idx + 1}...")
-                raw_rows.extend(extract_raw_rows(img))
+                st.info(f"Extracting grid cell topology from page {idx + 1}...")
+                page_data = extract_table_cells_opencv(img)
+                if page_data:
+                    raw_matrix.extend(page_data)
+                    
+            if raw_matrix:
+                max_cols = max([len(r) for r in raw_matrix])
+                df_raw = pd.DataFrame([r + [''] * (max_cols - len(r)) for r in raw_matrix])
                 
-            max_cols = max([len(r) for r in raw_rows]) if raw_rows else 0
-            df_raw = pd.DataFrame([r + [''] * (max_cols - len(r)) for r in raw_rows])
-            
-            if not df_raw.empty:
-                st.subheader("📋 Cleaned Raw OCR Matrix Preview")
+                st.subheader("📋 OpenCV Grid Matrix Preview")
                 st.dataframe(df_raw, use_container_width=True)
                 
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df_raw.to_excel(writer, index=False, header=[f"Col_{i+1}" for i in range(max_cols)])
                 buffer.seek(0)
-                
-                st.download_button("📥 Download Cleaned Raw Excel", buffer, "raw_ocr_output_cleaned.xlsx")
+                st.download_button("📥 Download Grid Excel", buffer, "raw_grid_output.xlsx")
+            else:
+                st.warning("No explicit grid lines detected. Verify chart scan quality.")
 
 # ---------------------------------------------------------
 # STAGE 2: EXCEL NORMALIZATION & FLATTENING
 # ---------------------------------------------------------
 else:
     st.title("⚙️ Stage 2: Cleaned Excel to Flattened Table")
-    st.write("Upload your Stage 1 cleaned Excel file (`raw_ocr_output_cleaned.xlsx`) to generate the final dataset.")
+    st.write("Upload your Stage 1 Excel file (`raw_grid_output.xlsx`) to generate the final dataset.")
 
     uploaded_excel = st.file_uploader("Upload Intermediate Excel File", type=["xlsx", "xls"])
 
@@ -119,13 +150,11 @@ else:
                     except ValueError:
                         continue
             
-            # Format 1: Base MM + 10 Offset Columns (0 to 9)
             if len(nums) >= 11:
                 base_mm = nums[0]
                 if 0 <= base_mm <= 5000:
                     for offset in range(10):
                         records.append({'MM': int(base_mm + offset), 'LTRS': nums[offset + 1]})
-            # Format 2: Direct Pair [MM, LTRS]
             elif len(nums) == 2:
                 mm_val, ltrs_val = nums[0], nums[1]
                 if 0 <= mm_val <= 5000:
@@ -156,4 +185,4 @@ else:
             
             st.download_button("📥 Download Final Flattened Excel", buffer, "Final_Calibration_Table.xlsx")
         else:
-            st.error("No valid table records recognized in range 0-5000 MM. Verify column values in the input Excel file.")
+            st.error("No valid table records recognized in range 0-5000 MM.")
