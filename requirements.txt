@@ -4,5 +4,8 @@ numpy
 openpyxl
 Pillow
 pdf2image
+opencv-python-headless
 easyocr
-torch --extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
