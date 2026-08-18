@@ -1,134 +1,132 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import io
 import re
+from PIL import Image
 
 try:
-    from PIL import Image
-    import pytesseract
+    import easyocr
+    reader = easyocr.Reader(['en'], gpu=False)
+except ImportError:
+    reader = None
+
+try:
     from pdf2image import convert_from_bytes
 except ImportError:
-    pytesseract = None
+    convert_from_bytes = None
 
-st.set_page_config(page_title="Calibration Chart Converter", layout="wide")
-st.title("📊 Tank Calibration Chart Converter & Flatten Tool")
+st.set_page_config(page_title="Advanced OCR Table Extractor", layout="wide")
+st.title("📊 Multi-Format Calibration Chart OCR Tool")
 
 uploaded_file = st.file_uploader(
-    "Upload Calibration File", 
-    type=["xlsx", "xls", "csv", "pdf", "png", "jpg", "jpeg"]
+    "Upload Scanned Chart (PDF, PNG, JPG)", 
+    type=["pdf", "png", "jpg", "jpeg"]
 )
 
-def parse_ocr_blocks_to_df(image):
+def extract_rows_with_easyocr(image):
     """
-    Extracts text using bounding box coordinates to ensure numbers
-    stay in their exact table columns and rows.
+    Extracts text blocks with pixel coordinates and groups them into rows 
+    based on vertical (Y) alignment to handle different table structures.
     """
-    if not pytesseract:
-        return pd.DataFrame()
+    img_np = np.array(image)
+    # OCR returns: [ [bbox, text, confidence], ... ]
+    results = reader.readtext(img_np)
     
-    # Get bounding boxes and word coordinates
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DATAFRAME)
-    data = data.dropna(subset=['text'])
-    data['text'] = data['text'].astype(str).str.strip()
-    data = data[data['text'] != '']
+    # Sort detected text vertically by Y-min coordinate
+    results.sort(key=lambda x: x[0][0][1])
     
-    # Group words by line coordinates
-    lines = []
-    grouped = data.groupby(['page_num', 'block_num', 'par_num', 'line_num'])
-    for _, group in grouped:
-        sorted_words = group.sort_values('left')['text'].tolist()
-        lines.append(sorted_words)
+    rows = []
+    current_row = []
+    last_y = None
     
-    # Process numeric calibration rows
-    structured_rows = []
-    for words in lines:
-        nums = []
-        for w in words:
-            cleaned = re.sub(r'[^0-9.]', '', w.replace(',', '.'))
-            if cleaned:
-                nums.append(cleaned)
+    for bbox, text, conf in results:
+        y_min = bbox[0][1]
         
-        if len(nums) >= 2:
-            structured_rows.append(nums)
-            
-    if structured_rows:
-        max_cols = max(len(r) for r in structured_rows)
-        padded = [r + [None]*(max_cols - len(r)) for r in structured_rows]
-        cols = ['H_MM'] + [str(i) for i in range(max_cols - 1)]
-        return pd.DataFrame(padded, columns=cols[:max_cols])
+        # Group text into the same row if Y-coordinates are within 10 pixels
+        if last_y is None or abs(y_min - last_y) < 12:
+            current_row.append((bbox[0][0], text)) # Store (X-coord, text)
+        else:
+            # Sort items in the completed row left-to-right by X-coord
+            current_row.sort(key=lambda x: x[0])
+            rows.append([item[1] for item in current_row])
+            current_row = [(bbox[0][0], text)]
+        last_y = y_min
         
-    return pd.DataFrame()
+    if current_row:
+        current_row.sort(key=lambda x: x[0])
+        rows.append([item[1] for item in current_row])
+        
+    return rows
 
-def flatten_calibration_df(df):
+def normalize_calibration_table(raw_rows):
+    """
+    Dynamically identifies if the extracted table is a 10-column grid 
+    or a 2-column list, then flattens it to single MM->LTRS pairs.
+    """
     records = []
-    h_col = df.columns[0]
     
-    for _, row in df.iterrows():
-        try:
-            base_mm = float(str(row[h_col]).replace(',', '').strip())
+    for row in raw_rows:
+        # Extract all numeric values in the row
+        nums = []
+        for word in row:
+            cleaned = re.sub(r'[^0-9.]', '', word.replace(',', '.'))
+            if cleaned:
+                try:
+                    nums.append(float(cleaned))
+                except ValueError:
+                    continue
+        
+        # Case A: 10-Column Grid Matrix (Base MM + 10 Offsets)
+        if len(nums) >= 11:
+            base_mm = nums[0]
             for offset in range(10):
-                col_key = str(offset)
-                if col_key in df.columns and pd.notnull(row[col_key]):
-                    val_str = str(row[col_key]).replace(',', '').strip()
-                    val = float(val_str)
-                    records.append({'MM': int(base_mm + offset), 'LTRS': val})
-        except (ValueError, TypeError):
-            continue
+                records.append({'MM': int(base_mm + offset), 'LTRS': nums[offset + 1]})
+                
+        # Case B: Standard 2-Column Format (MM, LTRS)
+        elif len(nums) == 2:
+            records.append({'MM': int(nums[0]), 'LTRS': nums[1]})
             
-    flattened = pd.DataFrame(records)
-    if not flattened.empty:
-        flattened = flattened.sort_values('MM').drop_duplicates('MM').reset_index(drop=True)
-        max_mm = int(flattened['MM'].max())
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.sort_values('MM').drop_duplicates('MM').reset_index(drop=True)
         
-        # Build complete 0 to max_mm sequence
-        full_range = pd.DataFrame({'MM': range(0, max_mm + 1)})
-        merged = pd.merge(full_range, flattened, on='MM', how='left')
+        # Fill missing values across the full millimeter height range
+        full_range = pd.DataFrame({'MM': range(0, int(df['MM'].max()) + 1)})
+        df = pd.merge(full_range, df, on='MM', how='left')
+        df['LTRS'] = df['LTRS'].interpolate(method='linear').bfill().ffill()
         
-        # Linear interpolation for missing values
-        merged['LTRS'] = merged['LTRS'].interpolate(method='linear').bfill().ffill()
-        return merged
     return df
 
 if uploaded_file:
-    file_type = uploaded_file.name.split('.')[-1].lower()
-    df_extracted = None
-
-    if file_type in ['xlsx', 'xls', 'csv']:
-        df_extracted = pd.read_csv(uploaded_file) if file_type == 'csv' else pd.read_excel(uploaded_file)
-
-    elif file_type == 'pdf':
-        st.info("📄 Processing multi-page PDF...")
-        if pytesseract:
-            try:
-                uploaded_file.seek(0)
-                images = convert_from_bytes(uploaded_file.read())
-                
-                all_page_dfs = []
-                for i, img in enumerate(images):
-                    st.write(f"🔍 Reading page {i+1} of {len(images)}...")
-                    page_df = parse_ocr_blocks_to_df(img)
-                    if not page_df.empty:
-                        all_page_dfs.append(page_df)
-                
-                if all_page_dfs:
-                    df_extracted = pd.concat(all_page_dfs, ignore_index=True)
-            except Exception as e:
-                st.error(f"OCR Exception: {e}")
-
-    if df_extracted is not None and not df_extracted.empty:
-        flattened_df = flatten_calibration_df(df_extracted)
+    if reader is None:
+        st.error("Please install EasyOCR: `pip install easyocr`")
+    else:
+        images = []
+        file_type = uploaded_file.name.split('.')[-1].lower()
         
-        st.subheader(f"✅ Extracted & Flattened Data ({len(flattened_df)} total MM points)")
-        st.dataframe(flattened_df, use_container_width=True)
+        if file_type == 'pdf':
+            images = convert_from_bytes(uploaded_file.read())
+        else:
+            images = [Image.open(uploaded_file)]
+            
+        all_rows = []
+        for idx, img in enumerate(images):
+            st.write(f"🔍 Performing Deep Spatial OCR on page {idx + 1}...")
+            rows = extract_rows_with_easyocr(img)
+            all_rows.extend(rows)
+            
+        final_df = normalize_calibration_table(all_rows)
         
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            flattened_df.to_excel(writer, sheet_name='Flattened_Calibration', index=False)
-        buffer.seek(0)
-        
-        st.download_button(
-            label="📥 Download Complete Flattened Excel File",
-            data=buffer,
-            file_name="Flattened_Calibration_Data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        if not final_df.empty:
+            st.subheader(f"✅ Extracted & Flattened Calibration ({len(final_df)} MM entries)")
+            st.dataframe(final_df, use_container_width=True)
+            
+            # Export to Excel
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                final_df.to_excel(writer, index=False)
+            buffer.seek(0)
+            st.download_button("📥 Download Excel File", buffer, "calibration.xlsx")
+        else:
+            st.warning("Could not structure table from image. Ensure image clarity is high.")
